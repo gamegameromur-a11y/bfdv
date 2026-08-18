@@ -1,0 +1,196 @@
+name: Android Build
+
+# Her push ve pull request'te tetiklenir; ayrıca Actions sekmesinden
+# manuel olarak da (workflow_dispatch) çalıştırılabilir.
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+# Zip dosyasının repo kökündeki adı. GitHub web arayüzünden
+# "Add file > Upload files" ile bu isimde bir zip yüklenmesi bekleniyor.
+# Farklı bir isim kullanırsan sadece burayı değiştirmen yeterli —
+# workflow'un başka hiçbir yerini değiştirmene gerek yok.
+env:
+  ZIP_FILE: testthephone-skeleton.zip
+  EXTRACT_DIR: extracted-app
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Zip dosyası repo kökünde bir "içerik" olarak duruyor, kendisi
+      # bir Android projesi değil (Gradle onu görmezden gelir, `app.zip`
+      # diye bir modül aramaya çalışmaz). Bu adım zip'i açıp gerçek
+      # proje dosyalarını ayrı bir dizine (${{ env.EXTRACT_DIR }})
+      # çıkarır — sonraki tüm adımlar bu dizin İÇİNDE çalışır.
+      - name: Verify zip exists
+        run: |
+          if [ ! -f "${{ env.ZIP_FILE }}" ]; then
+            echo "::error::${{ env.ZIP_FILE }} repo kökünde bulunamadı. Zip dosyasını doğru isimle yüklediğinden emin ol, ya da bu workflow'daki ZIP_FILE değerini güncelle."
+            exit 1
+          fi
+
+      - name: Extract project zip
+        run: |
+          mkdir -p "${{ env.EXTRACT_DIR }}"
+          unzip -q "${{ env.ZIP_FILE }}" -d "${{ env.EXTRACT_DIR }}"
+
+          # Zip'in içeriği ya doğrudan proje dosyalarını (settings.gradle.kts
+          # kök dizinde) ya da tek bir üst klasör içinde proje dosyalarını
+          # barındırabilir — hangi şekilde sıkıştırıldığına bağlı. Bu adım
+          # her iki durumu da otomatik algılayıp gerçek proje kökünü bulur.
+          if [ -f "${{ env.EXTRACT_DIR }}/settings.gradle.kts" ]; then
+            echo "PROJECT_ROOT=${{ env.EXTRACT_DIR }}" >> "$GITHUB_ENV"
+          else
+            INNER_DIR=$(find "${{ env.EXTRACT_DIR }}" -maxdepth 1 -mindepth 1 -type d | head -1)
+            if [ -z "$INNER_DIR" ] || [ ! -f "$INNER_DIR/settings.gradle.kts" ]; then
+              echo "::error::Zip içinde settings.gradle.kts bulunamadı — zip'in içeriğini kontrol et."
+              exit 1
+            fi
+            echo "PROJECT_ROOT=$INNER_DIR" >> "$GITHUB_ENV"
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      # NOT: Zip'in içinde gradle-wrapper.jar (ikili dosya) yok — sadece
+      # gradle-wrapper.properties var. gradle/actions/setup-gradle, wrapper
+      # jar'ı olmasa bile doğru Gradle sürümünü (properties dosyasından
+      # okuyarak) kurup PATH'e ekliyor, böylece ./gradlew yerine doğrudan
+      # `gradle` komutu güvenle kullanılabiliyor.
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: wrapper
+          build-root-directory: ${{ env.PROJECT_ROOT }}
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-
+
+      # Debug build imzalama gerektirmez (Android'in kendi debug
+      # keystore'unu kullanır) — bu yüzden ayrı bir secret kurulumu
+      # olmadan her zaman çalışır. Bu adım, zip içindeki projenin
+      # GERÇEKTEN derlenip derlenmediğinin ilk ve en hızlı kontrolü.
+      - name: Build debug APK
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: gradle assembleDebug --stacktrace
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: ${{ env.PROJECT_ROOT }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      # Lint, derleme hatası vermeyen ama potansiyel sorunları
+      # (kullanılmayan kaynaklar, eksik çeviri, erişilebilirlik
+      # uyarıları vb.) yakalayan statik analiz.
+      - name: Run lint
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: gradle lintDebug --stacktrace
+        continue-on-error: true
+
+      - name: Upload lint results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-report
+          path: ${{ env.PROJECT_ROOT }}/app/build/reports/lint-results-debug.html
+          if-no-files-found: ignore
+
+  # Release build AYRI bir job — imzalama secret'ları (KEYSTORE_BASE64,
+  # KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD) GitHub repo Settings >
+  # Secrets and variables > Actions altında tanımlanmadıysa otomatik
+  # imzasız APK üretir; secret'ları eklemeden de bu job çalışmaya
+  # devam eder.
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract project zip
+        run: |
+          mkdir -p "${{ env.EXTRACT_DIR }}"
+          unzip -q "${{ env.ZIP_FILE }}" -d "${{ env.EXTRACT_DIR }}"
+          if [ -f "${{ env.EXTRACT_DIR }}/settings.gradle.kts" ]; then
+            echo "PROJECT_ROOT=${{ env.EXTRACT_DIR }}" >> "$GITHUB_ENV"
+          else
+            INNER_DIR=$(find "${{ env.EXTRACT_DIR }}" -maxdepth 1 -mindepth 1 -type d | head -1)
+            echo "PROJECT_ROOT=$INNER_DIR" >> "$GITHUB_ENV"
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: wrapper
+          build-root-directory: ${{ env.PROJECT_ROOT }}
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-
+
+      - name: Check if signing secrets are configured
+        id: check_secrets
+        run: |
+          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "has_secrets=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_secrets=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Decode keystore
+        if: steps.check_secrets.outputs.has_secrets == 'true'
+        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "${{ env.PROJECT_ROOT }}/app/release-keystore.jks"
+
+      - name: Build signed release APK
+        if: steps.check_secrets.outputs.has_secrets == 'true'
+        working-directory: ${{ env.PROJECT_ROOT }}
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: gradle assembleRelease --stacktrace
+
+      - name: Build unsigned release APK
+        if: steps.check_secrets.outputs.has_secrets == 'false'
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: gradle assembleRelease --stacktrace
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release
+          path: ${{ env.PROJECT_ROOT }}/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
